@@ -42,7 +42,7 @@ Radiological Society of North America (RSNA) 2023  <br/>
 
 **&#9733; We have maintained a document for [Frequently Asked Questions](document/frequently_asked_questions.md).**
 
-**&#9733; We have maintained a paper list for [Awesome Medical SAM](document/awesome_medical_segment_anything.md).**
+**&#9733; We have maintained a paper list for [Awesome Medical Segment Anything Model](document/awesome_medical_segment_anything.md).**
 
 **&#9733; We have maintained a paper list for [Awesome Medical Pre-Training](document/awesome_medical_pretraining.md).**
 
