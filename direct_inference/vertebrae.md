@@ -120,4 +120,5 @@ To identify the errors, you will need some knowledge about vertebrae in the huma
 
 ##### Related Work
 
-Liu, Junqi, Dongli He, Wenxuan Li, Ningyu Wang, Alan L. Yuille, and Zongwei Zhou. ["ShapeKit."](https://www.cs.jhu.edu/~zongwei/publication/liu2025shapekit.pdf) In International Workshop on Shape in Medical Imaging, pp. 44-58. Cham: Springer Nature Switzerland, 2025. 
+[1] Liu, Junqi, Dongli He, Wenxuan Li, Ningyu Wang, Alan L. Yuille, and Zongwei Zhou. ["ShapeKit."](https://www.cs.jhu.edu/~zongwei/publication/liu2025shapekit.pdf) In International Workshop on Shape in Medical Imaging, pp. 44-58. Cham: Springer Nature Switzerland, 2025. 
+[2] sss
