@@ -106,7 +106,7 @@ AbdomenAtlasDemoPredict
 
 ##### 4. [Important!] Postprocess vertebrae masks
 
-Please check the AI-predicted vertebrae masks and the original CT scans. If you look closely at the AI-predicted masks, you will see many errors. Please design an automatic postprocessing to reduce these errors as many as you can. The postprocessing should be formatted in a separated python file `postprocessing_vertebrae.py`.
+Check the AI-predicted vertebrae masks (`combined_labels.nii.gz`) and the original CT scans (`ct.nii.gz`) using software such as [ITK-SNAP](https://www.itksnap.org/pmwiki/pmwiki.php). If you look closely at the AI-predicted masks, you will see many errors. Please design an automatic postprocessing to reduce these errors as many as you can. The postprocessing should be formatted in a separated python file `postprocessing_vertebrae.py`.
 
 This is an illustration of vertebrae (and rib) label refinement.
 
