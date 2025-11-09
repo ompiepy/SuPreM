@@ -122,4 +122,6 @@ To identify the errors, you will need some knowledge about vertebrae in the huma
 
 [1] Liu, Junqi, Dongli He, Wenxuan Li, Ningyu Wang, Alan L. Yuille, and Zongwei Zhou. ["ShapeKit."](https://www.cs.jhu.edu/~zongwei/publication/liu2025shapekit.pdf) In International Workshop on Shape in Medical Imaging, pp. 44-58. Cham: Springer Nature Switzerland, 2025. 
 
+[3] Meng, Di, Edmond Boyer, and Sergi Pujades. ["Vertebrae localization, segmentation and identification using a graph optimization and an anatomic consistency cycle."](https://gitlab.inria.fr/spine/vertebrae_segmentation) Computerized Medical Imaging and Graphics 107 (2023): 102235.
+
 [2] Jaus, Alexander, Constantin Seibold, Kelsey Hermann, Negar Shahamiri, Alexandra Walter, Kristina Giske, Johannes Haubold, Jens Kleesiek, and Rainer Stiefelhagen. ["Towards unifying anatomy segmentation: Automated generation of a full-body ct dataset."](https://github.com/alexanderjaus/AtlasDataset) In 2024 IEEE International Conference on Image Processing (ICIP), pp. 41-47. IEEE, 2024.
