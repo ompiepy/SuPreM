@@ -121,4 +121,5 @@ To identify the errors, you will need some knowledge about vertebrae in the huma
 ##### Related Work
 
 [1] Liu, Junqi, Dongli He, Wenxuan Li, Ningyu Wang, Alan L. Yuille, and Zongwei Zhou. ["ShapeKit."](https://www.cs.jhu.edu/~zongwei/publication/liu2025shapekit.pdf) In International Workshop on Shape in Medical Imaging, pp. 44-58. Cham: Springer Nature Switzerland, 2025. 
-[2] sss
+
+[2] Jaus, Alexander, Constantin Seibold, Kelsey Hermann, Negar Shahamiri, Alexandra Walter, Kristina Giske, Johannes Haubold, Jens Kleesiek, and Rainer Stiefelhagen. ["Towards unifying anatomy segmentation: Automated generation of a full-body ct dataset."](https://github.com/alexanderjaus/AtlasDataset) In 2024 IEEE International Conference on Image Processing (ICIP), pp. 41-47. IEEE, 2024.
