@@ -1,24 +1,15 @@
 #!/usr/bin/env python3
 """
-Postprocess AI-predicted vertebrae masks to reduce artifacts, fragmentation,
-label overlaps, and anatomical ordering errors.  See vertebrae.md step 4.
+Postprocess vertebrae segmentation masks produced by SuPreM inference.
 
-Pipeline
---------
- 1. Load ``combined_labels.nii.gz`` (and optionally ``ct.nii.gz``)
- 2. Auto-detect superior-inferior (SI) axis from the NIfTI affine
- 3. Per-label connected-component cleanup (keep largest, drop fragments)
- 4. Spine-centerline outlier removal (discard blobs far from the spine)
- 5. Resolve label overlaps via Euclidean distance transforms
- 6. Enforce anatomical ordering along the SI axis (handles partial scans)
- 7. Fill gaps within the spine envelope (nearest-label assignment)
- 8. Interpolate missing vertebrae in the label sequence
- 9. Per-vertebra adaptive morphological regularization
-10. Gaussian soft-voting label smoothing for clean boundaries
-11. Final overlap cleanup after smoothing
-12. (Optional) CT-guided bone-mask boundary refinement
-13. Volume & adjacency sanity checks
-14. Save refined combined + per-label masks
+Cleans up common prediction errors: small fragments, overlapping labels,
+wrong ordering, gaps between vertebrae, jagged boundaries, etc.
+Optionally uses the original CT to trim non-bone voxels.
+
+Usage:
+    python postprocessing_vertebrae.py --input_dir ./AbdomenAtlasDemoPredict
+    python postprocessing_vertebrae.py --input_dir ./AbdomenAtlasDemoPredict \
+        --ct_root_path /path/to/AbdomenAtlasDemo
 """
 import argparse
 import os
@@ -31,8 +22,9 @@ import fastremap
 from scipy import ndimage
 from scipy.ndimage import distance_transform_edt
 
-VERTEBRAE_LABELS = list(range(1, 25))
-CLASS_MAP_VERTEBRAE = {
+# Label 1 = L5 (most inferior) ... Label 24 = C1 (most superior)
+VERT_LABELS = list(range(1, 25))
+VERT_NAMES = {
     1: "vertebrae_L5",  2: "vertebrae_L4",  3: "vertebrae_L3",
     4: "vertebrae_L2",  5: "vertebrae_L1",
     6: "vertebrae_T12", 7: "vertebrae_T11", 8: "vertebrae_T10",
@@ -45,281 +37,251 @@ CLASS_MAP_VERTEBRAE = {
 }
 
 
-# ───────────────────────────────────────────────────────────────────────────
-# Helpers
-# ───────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# small utilities
+# ---------------------------------------------------------------------------
 
 def detect_si_axis(affine):
-    """Return ``(axis_index, increasing_is_superior)`` from a NIfTI affine."""
-    codes = nib.aff2axcodes(affine)
-    for i, code in enumerate(codes):
+    """Figure out which voxel axis is superior-inferior from the NIfTI affine.
+    Returns (axis_index, True if increasing index = more superior).
+    """
+    for i, code in enumerate(nib.aff2axcodes(affine)):
         if code == "S":
             return i, True
         if code == "I":
             return i, False
+    # fallback: assume dim 2 runs S-I (common for axial CTs)
     return 2, True
 
 
-def compute_centroid(mask):
-    """Return ``(i, j, k)`` centroid of a binary mask, or ``None`` if empty."""
+def centroid_of(mask):
     if not np.any(mask):
         return None
     ijk = np.array(np.where(mask > 0))
-    return (float(ijk[0].mean()), float(ijk[1].mean()), float(ijk[2].mean()))
+    return tuple(float(ijk[ax].mean()) for ax in range(3))
 
 
-def _present_labels(masks):
-    """Return sorted list of labels that have non-empty masks."""
-    return sorted(l for l in VERTEBRAE_LABELS
-                  if masks.get(l) is not None and np.any(masks[l]))
+def nonempty_labels(masks):
+    return sorted(l for l in VERT_LABELS if masks.get(l) is not None and np.any(masks[l]))
 
 
-def _masks_to_combined(masks, shape):
-    """Merge per-label masks into a single label volume."""
-    combined = np.zeros(shape, dtype=np.int32)
-    for label in VERTEBRAE_LABELS:
-        m = masks.get(label)
+def merge_masks(masks, shape):
+    vol = np.zeros(shape, dtype=np.int32)
+    for lab in VERT_LABELS:
+        m = masks.get(lab)
         if m is not None and np.any(m):
-            combined[m > 0] = label
-    return combined
+            vol[m > 0] = lab
+    return vol
 
 
-def _combined_to_masks(combined):
-    """Split a combined label volume into per-label binary masks."""
-    return {label: (combined == label).astype(np.uint8) for label in VERTEBRAE_LABELS}
+def split_labels(vol):
+    return {lab: (vol == lab).astype(np.uint8) for lab in VERT_LABELS}
 
 
-# ───────────────────────────────────────────────────────────────────────────
-# Step 3 — Per-label connected-component cleanup
-# ───────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# connected-component cleanup
+# ---------------------------------------------------------------------------
 
-def keep_topk_largest_connected_object(npy_mask, k, area_least, out_mask, out_label):
-    labels_out = cc3d.connected_components(npy_mask.astype(np.uint8), connectivity=26)
+def keep_largest_components(binary_mask, k, min_size):
+    """Keep the k largest 26-connected components that exceed min_size voxels."""
+    cc_labels = cc3d.connected_components(binary_mask.astype(np.uint8), connectivity=26)
     areas = {}
-    for label, extracted in cc3d.each(labels_out, binary=True, in_place=True):
-        areas[label] = fastremap.foreground(extracted)
-    candidates = sorted(areas.items(), key=lambda item: item[1], reverse=True)
-    for i in range(min(k, len(candidates))):
-        if candidates[i][1] > area_least:
-            out_mask[labels_out == int(candidates[i][0])] = out_label
+    for comp_id, comp in cc3d.each(cc_labels, binary=True, in_place=True):
+        areas[comp_id] = fastremap.foreground(comp)
+    ranked = sorted(areas, key=areas.get, reverse=True)
+
+    out = np.zeros_like(binary_mask, dtype=np.uint8)
+    for comp_id in ranked[:k]:
+        if areas[comp_id] >= min_size:
+            out[cc_labels == comp_id] = 1
+    return out
 
 
-def extract_topk_largest_candidates(npy_mask, organ_num, area_least=0):
-    out_mask = np.zeros(npy_mask.shape, np.uint8)
-    keep_topk_largest_connected_object(npy_mask, organ_num, area_least, out_mask, 1)
-    return out_mask
-
-
-def per_label_cleanup(masks, min_voxels, keep_top_k=1):
+def cleanup_per_label(masks, min_voxels):
+    """For each vertebra, drop small fragments and keep only the biggest blob."""
     shape = next(iter(masks.values())).shape
     cleaned = {}
-    for label in VERTEBRAE_LABELS:
-        m = masks.get(label)
+    for lab in VERT_LABELS:
+        m = masks.get(lab)
         if m is None or not np.any(m):
-            cleaned[label] = np.zeros(shape, dtype=np.uint8)
-            continue
-        cleaned[label] = extract_topk_largest_candidates(
-            m.astype(np.uint8), organ_num=keep_top_k, area_least=min_voxels,
-        )
+            cleaned[lab] = np.zeros(shape, dtype=np.uint8)
+        else:
+            cleaned[lab] = keep_largest_components(m, k=1, min_size=min_voxels)
     return cleaned
 
 
-# ───────────────────────────────────────────────────────────────────────────
-# Step 4 — Spine-centerline outlier removal
-# ───────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# spine-centerline outlier removal
+# ---------------------------------------------------------------------------
 
-def remove_spine_outliers(masks, si_axis, max_deviation_voxels=60):
-    """Discard vertebrae whose centroids are far from the median spine line."""
-    other_axes = [i for i in range(3) if i != si_axis]
+def drop_outlier_vertebrae(masks, si_axis, max_dev=60):
+    """Remove vertebrae whose centroid is too far off the median spine line
+    in the lateral (non-SI) directions."""
+    lat_axes = [ax for ax in range(3) if ax != si_axis]
     centroids = {}
-    for label in VERTEBRAE_LABELS:
-        m = masks.get(label)
+    for lab in VERT_LABELS:
+        m = masks.get(lab)
         if m is not None and np.any(m):
-            c = compute_centroid(m)
+            c = centroid_of(m)
             if c is not None:
-                centroids[label] = c
+                centroids[lab] = c
     if len(centroids) < 3:
         return masks
 
-    pos = np.array([[centroids[l][ax] for ax in other_axes] for l in centroids])
-    median_pos = np.median(pos, axis=0)
+    lat_pos = np.array([[centroids[l][ax] for ax in lat_axes] for l in centroids])
+    median_lat = np.median(lat_pos, axis=0)
 
     shape = next(iter(masks.values())).shape
-    for label, c in list(centroids.items()):
-        p = np.array([c[ax] for ax in other_axes])
-        if np.linalg.norm(p - median_pos) > max_deviation_voxels:
-            name = CLASS_MAP_VERTEBRAE.get(label, str(label))
-            print(f"    Removed outlier: {name} (label {label})")
-            masks[label] = np.zeros(shape, dtype=np.uint8)
+    for lab, c in list(centroids.items()):
+        offset = np.array([c[ax] for ax in lat_axes])
+        if np.linalg.norm(offset - median_lat) > max_dev:
+            print(f"    dropped outlier: {VERT_NAMES.get(lab, lab)}")
+            masks[lab] = np.zeros(shape, dtype=np.uint8)
     return masks
 
 
-# ───────────────────────────────────────────────────────────────────────────
-# Step 5 — Overlap resolution via distance transforms
-# ───────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# overlap resolution (distance-transform based)
+# ---------------------------------------------------------------------------
 
 def resolve_overlaps(masks, shape):
-    """Assign contested voxels to the label they are deepest inside of."""
-    label_count = np.zeros(shape, dtype=np.int32)
+    """Where two+ labels claim the same voxel, give it to whichever label
+    that voxel is deepest inside of (highest EDT value)."""
+    count = np.zeros(shape, dtype=np.int32)
     present = []
-    for label in VERTEBRAE_LABELS:
-        m = masks.get(label)
+    for lab in VERT_LABELS:
+        m = masks.get(lab)
         if m is not None and np.any(m):
-            label_count += (m > 0).astype(np.int32)
-            present.append(label)
+            count += (m > 0).astype(np.int32)
+            present.append(lab)
 
-    combined = np.zeros(shape, dtype=np.int32)
-    for label in present:
-        combined[masks[label] > 0] = label
+    vol = np.zeros(shape, dtype=np.int32)
+    for lab in present:
+        vol[masks[lab] > 0] = lab
 
-    contested = label_count > 1
+    contested = count > 1
     if not np.any(contested):
-        return combined
+        return vol
 
-    ijk = np.array(np.where(contested))
-    best_dist = np.full(ijk.shape[1], -1.0)
-    best_label = np.zeros(ijk.shape[1], dtype=np.int32)
-
-    for label in present:
-        m = masks[label]
-        has_voxel = m[ijk[0], ijk[1], ijk[2]] > 0
-        if not np.any(has_voxel):
+    pts = np.array(np.where(contested))
+    best_d = np.full(pts.shape[1], -1.0)
+    best_l = np.zeros(pts.shape[1], dtype=np.int32)
+    for lab in present:
+        m = masks[lab]
+        hit = m[pts[0], pts[1], pts[2]] > 0
+        if not np.any(hit):
             continue
         dt = distance_transform_edt(m > 0)
-        d = dt[ijk[0], ijk[1], ijk[2]]
-        better = (d > best_dist) & has_voxel
-        best_dist[better] = d[better]
-        best_label[better] = label
+        d = dt[pts[0], pts[1], pts[2]]
+        better = (d > best_d) & hit
+        best_d[better] = d[better]
+        best_l[better] = lab
+    vol[pts[0], pts[1], pts[2]] = best_l
+    return vol
 
-    combined[ijk[0], ijk[1], ijk[2]] = best_label
-    return combined
 
+# ---------------------------------------------------------------------------
+# anatomical ordering
+# ---------------------------------------------------------------------------
 
-# ───────────────────────────────────────────────────────────────────────────
-# Step 6 — Anatomical ordering enforcement (handles partial scans)
-# ───────────────────────────────────────────────────────────────────────────
+def fix_label_ordering(masks, si_axis, si_up):
+    """Make sure label values increase from inferior to superior.
 
-def enforce_anatomical_ordering(masks, si_axis, si_increasing_is_superior):
-    """Re-assign labels so spatial order along SI matches label order.
-
-    The *set* of present label values is preserved; only their spatial
-    assignment is corrected.  Partial scans keep their original label range.
+    Keeps the same *set* of label values that exist in the prediction,
+    just reassigns them so spatial position matches anatomical order.
+    This way partial scans (e.g. only T1-L5 visible) stay correctly
+    labeled instead of being wrongly shifted to start at C1.
     """
     centroids = {}
-    for label in VERTEBRAE_LABELS:
-        m = masks.get(label)
+    for lab in VERT_LABELS:
+        m = masks.get(lab)
         if m is not None and np.any(m):
-            c = compute_centroid(m)
+            c = centroid_of(m)
             if c is not None:
-                centroids[label] = c
-
+                centroids[lab] = c
     if len(centroids) < 2:
         return masks
 
-    sign = 1 if si_increasing_is_superior else -1
-    blobs_inferior_to_superior = sorted(
-        centroids.keys(),
-        key=lambda L: sign * centroids[L][si_axis],
-    )
+    sign = 1 if si_up else -1
+    by_position = sorted(centroids, key=lambda l: sign * centroids[l][si_axis])
+    by_value = sorted(centroids)
 
-    sorted_label_values = sorted(centroids.keys())
-    if blobs_inferior_to_superior == sorted_label_values:
-        return masks
+    if by_position == by_value:
+        return masks  # already fine
 
-    new_for_old = {}
-    for k, old_label in enumerate(blobs_inferior_to_superior):
-        new_for_old[old_label] = sorted_label_values[k]
-
+    remap = {old: new for old, new in zip(by_position, by_value)}
     shape = next(iter(masks.values())).shape
-    refined = {label: np.zeros(shape, dtype=np.uint8) for label in VERTEBRAE_LABELS}
-    for old_label, new_label in new_for_old.items():
-        m = masks.get(old_label)
+    out = {lab: np.zeros(shape, dtype=np.uint8) for lab in VERT_LABELS}
+    for old, new in remap.items():
+        m = masks.get(old)
         if m is not None and np.any(m):
-            refined[new_label][m > 0] = 1
+            out[new][m > 0] = 1
 
-    swaps = sum(1 for o, n in new_for_old.items() if o != n)
-    if swaps:
-        print(f"    Reordered {swaps} label(s) to fix spatial ordering")
-    return refined
+    n_swaps = sum(1 for o, n in remap.items() if o != n)
+    if n_swaps:
+        print(f"    reordered {n_swaps} label(s)")
+    return out
 
 
-# ───────────────────────────────────────────────────────────────────────────
-# Step 7 — Fill gaps inside the spine envelope  (NEW)
-# ───────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# spine-envelope gap filling
+# ---------------------------------------------------------------------------
 
-def fill_spine_gaps(masks, si_axis, shape, gap_closing_radius=10):
-    """Fill unlabeled voxels that lie *inside* the spine envelope.
-
-    1. Build a binary spine mask from all labels.
-    2. Close it with an elongated kernel along the SI axis to bridge
-       inter-vertebra gaps.
-    3. Apply a small isotropic closing to seal lateral holes.
-    4. Fill 3-D holes in the envelope.
-    5. Assign every unlabeled voxel inside the envelope to the nearest
-       vertebra label via a distance transform.
-    """
-    combined = _masks_to_combined(masks, shape)
-    labeled_mask = combined > 0
-    if not np.any(labeled_mask):
+def fill_gaps_in_spine(masks, si_axis, shape, closing_radius=10):
+    """Close gaps between adjacent vertebrae by building a spine envelope
+    and assigning unlabeled interior voxels to the nearest label."""
+    vol = merge_masks(masks, shape)
+    has_label = vol > 0
+    if not np.any(has_label):
         return masks
 
-    # Elongated closing kernel along the SI axis to bridge gaps between vertebrae
-    si_kernel_shape = [3, 3, 3]
-    si_kernel_shape[si_axis] = gap_closing_radius * 2 + 1
-    si_kernel = np.ones(si_kernel_shape, dtype=bool)
-    spine_envelope = ndimage.binary_closing(labeled_mask, structure=si_kernel)
+    # elongated closing along the spine to bridge inter-vertebra spaces
+    kern = [3, 3, 3]
+    kern[si_axis] = closing_radius * 2 + 1
+    envelope = ndimage.binary_closing(has_label, structure=np.ones(kern, dtype=bool))
+    # small isotropic pass + hole fill to clean up the envelope
+    envelope = ndimage.binary_closing(envelope, structure=np.ones((5, 5, 5), dtype=bool))
+    envelope = ndimage.binary_fill_holes(envelope)
 
-    # Small isotropic closing to seal any remaining lateral holes
-    spine_envelope = ndimage.binary_closing(spine_envelope,
-                                            structure=np.ones((5, 5, 5), dtype=bool))
-    spine_envelope = ndimage.binary_fill_holes(spine_envelope)
-
-    gaps = spine_envelope & ~labeled_mask
+    gaps = envelope & ~has_label
     n_gap = int(np.sum(gaps))
     if n_gap == 0:
         return masks
-    print(f"    Filling {n_gap} gap voxels inside spine envelope")
+    print(f"    filling {n_gap} gap voxels inside spine envelope")
 
-    # Nearest-label assignment for gap voxels
-    gap_ijk = np.array(np.where(gaps))
-    best_dist = np.full(gap_ijk.shape[1], np.inf)
-    best_label = np.zeros(gap_ijk.shape[1], dtype=np.int32)
+    # assign each gap voxel to the spatially closest vertebra
+    gap_pts = np.array(np.where(gaps))
+    best_d = np.full(gap_pts.shape[1], np.inf)
+    best_l = np.zeros(gap_pts.shape[1], dtype=np.int32)
+    for lab in nonempty_labels(masks):
+        dt = distance_transform_edt(~(masks[lab] > 0))
+        d = dt[gap_pts[0], gap_pts[1], gap_pts[2]]
+        closer = d < best_d
+        best_d[closer] = d[closer]
+        best_l[closer] = lab
 
-    for label in _present_labels(masks):
-        dt = distance_transform_edt(~(masks[label] > 0))
-        d = dt[gap_ijk[0], gap_ijk[1], gap_ijk[2]]
-        closer = d < best_dist
-        best_dist[closer] = d[closer]
-        best_label[closer] = label
-
-    new_combined = combined.copy()
-    new_combined[gap_ijk[0], gap_ijk[1], gap_ijk[2]] = best_label
-    return _combined_to_masks(new_combined)
+    filled = vol.copy()
+    filled[gap_pts[0], gap_pts[1], gap_pts[2]] = best_l
+    return split_labels(filled)
 
 
-# ───────────────────────────────────────────────────────────────────────────
-# Step 8 — Interpolate missing vertebrae  (NEW)
-# ───────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# missing vertebra interpolation
+# ---------------------------------------------------------------------------
 
-def interpolate_missing_vertebrae(masks, si_axis, si_increasing_is_superior, shape):
-    """If there are gaps in the label sequence, synthesise masks for them.
-
-    For each missing label between two present neighbors:
-      - Estimate the centroid by linear interpolation.
-      - Create an approximate mask by dilating a seed at the estimated
-        centroid, then crop it to a reasonable volume (median of neighbors).
-    """
-    present = _present_labels(masks)
+def interpolate_missing(masks, si_axis, si_up, shape):
+    """Try to fill in vertebrae that are missing from an otherwise
+    contiguous sequence by growing a seed at the interpolated position."""
+    present = nonempty_labels(masks)
     if len(present) < 2:
         return masks
 
-    centroids = {}
-    volumes = {}
-    for label in present:
-        c = compute_centroid(masks[label])
+    centroids, volumes = {}, {}
+    for lab in present:
+        c = centroid_of(masks[lab])
         if c is not None:
-            centroids[label] = np.array(c)
-            volumes[label] = int(np.sum(masks[label] > 0))
+            centroids[lab] = np.array(c)
+            volumes[lab] = int(np.sum(masks[lab] > 0))
 
     lo, hi = min(present), max(present)
     missing = [l for l in range(lo, hi + 1) if l not in present]
@@ -327,406 +289,336 @@ def interpolate_missing_vertebrae(masks, si_axis, si_increasing_is_superior, sha
         return masks
 
     median_vol = float(np.median(list(volumes.values())))
-    structure = ndimage.generate_binary_structure(3, 1)
+    struct6 = ndimage.generate_binary_structure(3, 1)
 
-    for label in missing:
-        below = [l for l in present if l < label]
-        above = [l for l in present if l > label]
+    for lab in missing:
+        below = [l for l in present if l < lab]
+        above = [l for l in present if l > lab]
         if not below or not above:
             continue
-        lb = max(below)
-        la = min(above)
-        if lb not in centroids or la not in centroids:
+        lo_nb, hi_nb = max(below), min(above)
+        if lo_nb not in centroids or hi_nb not in centroids:
             continue
 
-        frac = (label - lb) / (la - lb)
-        est_centroid = centroids[lb] * (1 - frac) + centroids[la] * frac
-        est_centroid = np.round(est_centroid).astype(int)
-        est_centroid = np.clip(est_centroid, 0, np.array(shape) - 1)
+        # linearly interpolate the centroid position
+        t = (lab - lo_nb) / (hi_nb - lo_nb)
+        est = np.round(centroids[lo_nb] * (1 - t) + centroids[hi_nb] * t).astype(int)
+        est = np.clip(est, 0, np.array(shape) - 1)
 
         target_vol = int(median_vol * 0.7)
 
+        # grow a ball from the estimated centroid
         seed = np.zeros(shape, dtype=np.uint8)
-        seed[est_centroid[0], est_centroid[1], est_centroid[2]] = 1
-        grown = seed.copy()
+        seed[est[0], est[1], est[2]] = 1
+        blob = seed.copy()
         for _ in range(80):
-            grown = ndimage.binary_dilation(grown, structure=structure).astype(np.uint8)
-            if int(np.sum(grown)) >= target_vol:
+            blob = ndimage.binary_dilation(blob, structure=struct6).astype(np.uint8)
+            if int(np.sum(blob)) >= target_vol:
                 break
 
-        # Trim to target volume by keeping voxels closest to centroid
-        ijk = np.array(np.where(grown > 0))
-        if ijk.shape[1] > target_vol:
-            dists = np.sum((ijk.T - est_centroid) ** 2, axis=1)
+        # trim excess voxels, keeping those closest to centroid
+        pts = np.array(np.where(blob > 0))
+        if pts.shape[1] > target_vol:
+            dists = np.sum((pts.T - est) ** 2, axis=1)
             keep = np.argsort(dists)[:target_vol]
-            trimmed = np.zeros(shape, dtype=np.uint8)
-            trimmed[ijk[0, keep], ijk[1, keep], ijk[2, keep]] = 1
-            grown = trimmed
+            blob = np.zeros(shape, dtype=np.uint8)
+            blob[pts[0, keep], pts[1, keep], pts[2, keep]] = 1
 
-        # Only keep voxels that don't overlap existing labels
-        existing = _masks_to_combined(masks, shape)
-        grown[existing > 0] = 0
-
-        if np.any(grown):
-            masks[label] = grown
-            name = CLASS_MAP_VERTEBRAE.get(label, str(label))
-            print(f"    Interpolated missing {name} (label {label}), "
-                  f"{int(np.sum(grown))} voxels")
+        # don't stomp on existing labels
+        blob[merge_masks(masks, shape) > 0] = 0
+        if np.any(blob):
+            masks[lab] = blob
+            print(f"    interpolated {VERT_NAMES.get(lab, lab)}: {int(np.sum(blob))} vox")
 
     return masks
 
 
-# ───────────────────────────────────────────────────────────────────────────
-# Step 9 — Per-vertebra adaptive morphological regularization  (NEW)
-# ───────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# morphological regularization (adaptive kernel per vertebra)
+# ---------------------------------------------------------------------------
 
-def adaptive_morphological_regularization(masks, fill_holes=True, base_closing=3):
-    """Morphological cleanup with per-vertebra adaptive kernel size.
-
-    Larger vertebrae (lumbar) get a bigger closing kernel; smaller ones
-    (cervical) get a smaller one.  This produces more anatomically
-    consistent shapes than a single fixed kernel.
+def morph_regularize(masks, fill_holes=True, base_closing=3):
+    """Hole-fill, close, and open each vertebra mask.
+    Kernel size scales with vertebra volume so lumbar vertebrae get a
+    larger closing kernel than cervical ones.
     """
     shape = next(iter(masks.values())).shape
-    present = _present_labels(masks)
+    present = nonempty_labels(masks)
     if not present:
         return masks
 
-    vol_map = {}
-    for label in present:
-        vol_map[label] = int(np.sum(masks[label] > 0))
-    median_vol = float(np.median(list(vol_map.values()))) if vol_map else 1.0
+    vols = {l: int(np.sum(masks[l] > 0)) for l in present}
+    med_vol = float(np.median(list(vols.values())))
 
     out = {}
-    for label in VERTEBRAE_LABELS:
-        m = masks.get(label)
+    for lab in VERT_LABELS:
+        m = masks.get(lab)
         if m is None or not np.any(m):
-            out[label] = np.zeros(shape, dtype=np.uint8)
+            out[lab] = np.zeros(shape, dtype=np.uint8)
             continue
 
-        vol_ratio = vol_map.get(label, median_vol) / max(median_vol, 1.0)
-        closing_sz = max(base_closing, int(base_closing * min(vol_ratio, 2.0)))
-        closing_sz = closing_sz if closing_sz % 2 == 1 else closing_sz + 1
+        ratio = vols.get(lab, med_vol) / max(med_vol, 1.0)
+        ksz = max(base_closing, int(base_closing * min(ratio, 2.0)))
+        ksz = ksz if ksz % 2 == 1 else ksz + 1  # keep odd
 
         m = m.astype(bool)
         if fill_holes:
             m = ndimage.binary_fill_holes(m)
-        struct = np.ones((closing_sz,) * 3)
-        m = ndimage.binary_closing(m, structure=struct)
-        # Small opening to remove thin spurs
-        if closing_sz >= 3:
+        m = ndimage.binary_closing(m, structure=np.ones((ksz,) * 3))
+        if ksz >= 3:
             m = ndimage.binary_opening(m, structure=np.ones((3, 3, 3)))
-        out[label] = m.astype(np.uint8)
+        out[lab] = m.astype(np.uint8)
     return out
 
 
-# ───────────────────────────────────────────────────────────────────────────
-# Step 10 — Gaussian soft-voting label smoothing  (NEW)
-# ───────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# gaussian label smoothing
+# ---------------------------------------------------------------------------
 
-def smooth_labels_gaussian(combined, sigma=1.0, min_confidence=0.08):
-    """Smooth label boundaries by Gaussian-weighted soft voting.
-
-    Each label's binary mask is convolved with a Gaussian.  At every voxel
-    the label with the highest blurred response wins, provided it exceeds
-    *min_confidence* (prevents labels from bleeding far into background).
-    The result has much smoother inter-vertebra boundaries.
+def smooth_labels(vol, sigma=1.5, min_conf=0.08):
+    """Blur each label channel with a Gaussian and pick the winner.
+    Gives much smoother inter-vertebra boundaries than raw voxelwise labels.
+    min_conf prevents labels from bleeding far into background.
     """
-    labels_present = np.unique(combined)
-    labels_present = labels_present[labels_present > 0]
-    if len(labels_present) == 0:
-        return combined
+    present = np.unique(vol)
+    present = present[present > 0]
+    if len(present) == 0:
+        return vol
 
-    scores = np.zeros(combined.shape + (len(labels_present),), dtype=np.float32)
-    for i, label in enumerate(labels_present):
+    scores = np.zeros(vol.shape + (len(present),), dtype=np.float32)
+    for i, lab in enumerate(present):
         scores[..., i] = ndimage.gaussian_filter(
-            (combined == label).astype(np.float32), sigma=sigma,
-        )
+            (vol == lab).astype(np.float32), sigma=sigma)
 
-    max_score = np.max(scores, axis=-1)
-    best_idx = np.argmax(scores, axis=-1)
-    result = np.zeros_like(combined)
-    has_label = max_score > min_confidence
-    result[has_label] = labels_present[best_idx[has_label]]
+    peak = np.max(scores, axis=-1)
+    winner = np.argmax(scores, axis=-1)
+    result = np.zeros_like(vol)
+    mask = peak > min_conf
+    result[mask] = present[winner[mask]]
     return result
 
 
-# ───────────────────────────────────────────────────────────────────────────
-# Step 12 — CT-guided bone-mask boundary refinement  (NEW, optional)
-# ───────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# CT-guided bone-mask refinement (optional)
+# ---------------------------------------------------------------------------
 
-def ct_guided_refinement(masks, ct_data, shape,
-                         bone_low=150, bone_high=3000,
-                         dilate_bone=2):
-    """Refine vertebra masks using CT bone intensity.
+def refine_with_ct(masks, ct, shape, hu_lo=150, hu_hi=3000, dilate=2):
+    """Intersect vertebra masks with a dilated bone mask from the CT.
+    Removes soft-tissue false positives while keeping partial-volume
+    boundary voxels thanks to the dilation."""
+    bone = (ct >= hu_lo) & (ct <= hu_hi)
+    if dilate > 0:
+        bone = ndimage.binary_dilation(
+            bone, structure=ndimage.generate_binary_structure(3, 1),
+            iterations=dilate)
 
-    Voxels claimed by a vertebra label but clearly outside the bone
-    Hounsfield-unit range are removed.  A small dilation of the bone mask
-    accounts for partial-volume effects at boundaries.
-    """
-    bone_mask = (ct_data >= bone_low) & (ct_data <= bone_high)
-    if dilate_bone > 0:
-        bone_mask = ndimage.binary_dilation(
-            bone_mask,
-            structure=ndimage.generate_binary_structure(3, 1),
-            iterations=dilate_bone,
-        )
-
-    trimmed_total = 0
+    total_trimmed = 0
     out = {}
-    for label in VERTEBRAE_LABELS:
-        m = masks.get(label)
+    for lab in VERT_LABELS:
+        m = masks.get(lab)
         if m is None or not np.any(m):
-            out[label] = np.zeros(shape, dtype=np.uint8)
+            out[lab] = np.zeros(shape, dtype=np.uint8)
             continue
-        refined = (m > 0) & bone_mask
-        trimmed_total += int(np.sum(m > 0)) - int(np.sum(refined))
-        # Ensure we keep at least the core (largest CC in intersection)
+        refined = (m > 0) & bone
+        total_trimmed += int(np.sum(m > 0)) - int(np.sum(refined))
         if np.any(refined):
-            out[label] = extract_topk_largest_candidates(
-                refined.astype(np.uint8), organ_num=1, area_least=50,
-            )
+            out[lab] = keep_largest_components(refined.astype(np.uint8), k=1, min_size=50)
         else:
-            out[label] = m  # keep original if bone mask removes everything
-    if trimmed_total > 0:
-        print(f"    CT-guided refinement trimmed {trimmed_total} non-bone voxels")
+            out[lab] = m
+    if total_trimmed > 0:
+        print(f"    CT refinement trimmed {total_trimmed} non-bone voxels")
     return out
 
 
-# ───────────────────────────────────────────────────────────────────────────
-# Sanity checks
-# ───────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# sanity checks (just prints warnings, doesn't modify anything)
+# ---------------------------------------------------------------------------
 
-def volume_sanity_check(masks, case_id):
-    volumes = []
-    for label in VERTEBRAE_LABELS:
-        m = masks.get(label)
-        if m is not None and np.any(m):
-            volumes.append((label, int(np.sum(m > 0))))
-    if len(volumes) < 2:
+def check_volumes(masks, case_id):
+    vols = [(l, int(np.sum(masks[l] > 0)))
+            for l in VERT_LABELS if masks.get(l) is not None and np.any(masks[l])]
+    if len(vols) < 2:
         return
-    vol_only = [v for _, v in volumes]
-    median_vol = float(np.median(vol_only))
-    for label, vol in volumes:
-        if vol > 3.0 * median_vol or vol < 0.3 * median_vol:
-            name = CLASS_MAP_VERTEBRAE.get(label, str(label))
-            print(f"  [WARNING] {case_id} {name} (label {label}): "
-                  f"volume={vol} voxels (median={median_vol:.0f})")
+    vals = [v for _, v in vols]
+    med = float(np.median(vals))
+    for lab, v in vols:
+        if v > 3 * med or v < 0.3 * med:
+            print(f"  [WARN] {case_id} {VERT_NAMES.get(lab, lab)}: "
+                  f"vol={v} (median={med:.0f})")
 
 
-def adjacency_check(masks, si_axis, case_id):
+def check_adjacency(masks, si_axis, case_id):
     centroids = {}
-    for label in VERTEBRAE_LABELS:
-        m = masks.get(label)
+    for lab in VERT_LABELS:
+        m = masks.get(lab)
         if m is not None and np.any(m):
-            c = compute_centroid(m)
+            c = centroid_of(m)
             if c is not None:
-                centroids[label] = c[si_axis]
-    present = sorted(centroids.keys())
+                centroids[lab] = c[si_axis]
+    present = sorted(centroids)
     if len(present) < 2:
         return
-    gaps = []
-    for a, b in zip(present[:-1], present[1:]):
-        gaps.append(abs(centroids[b] - centroids[a]))
-    if not gaps:
+    gaps = [abs(centroids[b] - centroids[a]) for a, b in zip(present, present[1:])]
+    med_gap = float(np.median(gaps))
+    if med_gap == 0:
         return
-    median_gap = float(np.median(gaps))
-    if median_gap == 0:
-        return
-    for i, (a, b) in enumerate(zip(present[:-1], present[1:])):
-        if gaps[i] > 3.0 * median_gap:
-            na = CLASS_MAP_VERTEBRAE.get(a, str(a))
-            nb = CLASS_MAP_VERTEBRAE.get(b, str(b))
-            print(f"  [WARNING] {case_id} large gap between {na} and {nb} "
-                  f"({gaps[i]:.0f} vs median {median_gap:.0f} voxels)")
+    for i, (a, b) in enumerate(zip(present, present[1:])):
+        if gaps[i] > 3 * med_gap:
+            print(f"  [WARN] {case_id} large gap between "
+                  f"{VERT_NAMES.get(a, a)} and {VERT_NAMES.get(b, b)} "
+                  f"({gaps[i]:.0f} vs median {med_gap:.0f})")
 
 
-# ───────────────────────────────────────────────────────────────────────────
-# Driver
-# ───────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# main per-case pipeline
+# ---------------------------------------------------------------------------
 
-def process_case(case_dir, output_dir, args, ct_root_path=None):
-    """Full postprocessing pipeline for one case."""
+def process_case(case_dir, output_dir, args, ct_root=None):
     combined_path = os.path.join(case_dir, "combined_labels.nii.gz")
     if not os.path.isfile(combined_path):
-        print(f"  Skip (no combined_labels.nii.gz): {case_dir}")
+        print(f"  skip {case_dir} (no combined_labels.nii.gz)")
         return
     case_id = os.path.basename(case_dir.rstrip("/"))
 
-    # ── Load ──
-    print(f"  [{case_id}] Loading prediction...")
+    print(f"  [{case_id}] loading...")
     nii = nib.load(combined_path)
     data = np.asarray(nii.dataobj).astype(np.int32)
     shape = data.shape
     affine = nii.affine.copy()
 
-    ct_data = None
-    if ct_root_path:
-        ct_path = os.path.join(ct_root_path, case_id, "ct.nii.gz")
+    # optionally load the original CT for bone-mask refinement
+    ct = None
+    if ct_root:
+        ct_path = os.path.join(ct_root, case_id, "ct.nii.gz")
         if os.path.isfile(ct_path):
-            print(f"  [{case_id}] Loading CT for guided refinement...")
+            print(f"  [{case_id}] loading CT...")
             ct_nii = nib.load(ct_path)
-            ct_data = np.asarray(ct_nii.dataobj).astype(np.float32)
-            if ct_data.shape != shape:
-                print(f"  [{case_id}] CT shape mismatch, skipping CT guidance")
-                ct_data = None
+            ct = np.asarray(ct_nii.dataobj).astype(np.float32)
+            if ct.shape != shape:
+                print(f"  [{case_id}] CT shape {ct.shape} != pred shape {shape}, skipping CT")
+                ct = None
 
     si_axis, si_up = detect_si_axis(affine)
-    ax_names = {0: "i (dim 0)", 1: "j (dim 1)", 2: "k (dim 2)"}
-    print(f"  [{case_id}] SI axis: {ax_names[si_axis]}, "
-          f"increasing={'superior' if si_up else 'inferior'}")
+    print(f"  [{case_id}] SI axis = dim {si_axis}, "
+          f"{'ascending' if si_up else 'descending'}")
 
-    masks = {label: (data == label).astype(np.uint8) for label in VERTEBRAE_LABELS}
-    present = _present_labels(masks)
-    print(f"  [{case_id}] Found {len(present)} vertebrae labels")
+    masks = {lab: (data == lab).astype(np.uint8) for lab in VERT_LABELS}
+    print(f"  [{case_id}] {len(nonempty_labels(masks))} labels in raw prediction")
 
-    # ── 3. Per-label CC cleanup ──
-    print(f"  [{case_id}] Per-label cleanup...")
-    masks = per_label_cleanup(masks, args.min_component_voxels, keep_top_k=1)
+    # -- clean small fragments --
+    masks = cleanup_per_label(masks, args.min_component_voxels)
 
-    # ── 4. Spine outlier removal ──
-    print(f"  [{case_id}] Spine-centerline outlier removal...")
-    masks = remove_spine_outliers(masks, si_axis, args.max_outlier_deviation)
+    # -- drop blobs far off the spine line --
+    masks = drop_outlier_vertebrae(masks, si_axis, args.max_outlier_deviation)
 
-    # ── 5. Overlap resolution ──
-    print(f"  [{case_id}] Resolving overlaps (distance transform)...")
-    combined = resolve_overlaps(masks, shape)
-    masks = _combined_to_masks(combined)
+    # -- resolve overlapping labels --
+    vol = resolve_overlaps(masks, shape)
+    masks = split_labels(vol)
 
-    # ── 6. Anatomical ordering ──
-    print(f"  [{case_id}] Enforcing anatomical ordering...")
-    masks = enforce_anatomical_ordering(masks, si_axis, si_up)
+    # -- fix any ordering violations --
+    masks = fix_label_ordering(masks, si_axis, si_up)
 
-    # ── 7. Spine-envelope gap filling ──
-    print(f"  [{case_id}] Filling gaps inside spine envelope...")
-    masks = fill_spine_gaps(masks, si_axis, shape,
-                            gap_closing_radius=args.gap_closing_radius)
+    # -- fill spaces between vertebrae inside the spine envelope --
+    masks = fill_gaps_in_spine(masks, si_axis, shape,
+                               closing_radius=args.gap_closing_radius)
 
-    # ── 8. Missing vertebra interpolation ──
+    # -- synthesise any missing vertebrae in the sequence --
     if not args.no_interpolate:
-        print(f"  [{case_id}] Interpolating missing vertebrae...")
-        masks = interpolate_missing_vertebrae(masks, si_axis, si_up, shape)
+        masks = interpolate_missing(masks, si_axis, si_up, shape)
 
-    # ── 9. Adaptive morphological regularization ──
-    print(f"  [{case_id}] Adaptive morphological regularization...")
-    masks = adaptive_morphological_regularization(
-        masks, fill_holes=not args.no_fill_holes,
-        base_closing=args.closing_size,
-    )
+    # -- per-vertebra morphological regularisation --
+    masks = morph_regularize(masks, fill_holes=not args.no_fill_holes,
+                             base_closing=args.closing_size)
 
-    # ── Re-resolve overlaps after morph ops ──
-    combined = resolve_overlaps(masks, shape)
-    masks = _combined_to_masks(combined)
+    # morph ops can re-introduce tiny overlaps, clean them up
+    vol = resolve_overlaps(masks, shape)
+    masks = split_labels(vol)
 
-    # ── 10. Gaussian label smoothing ──
-    print(f"  [{case_id}] Gaussian label smoothing (sigma={args.smooth_sigma})...")
-    combined = _masks_to_combined(masks, shape)
-    combined = smooth_labels_gaussian(combined, sigma=args.smooth_sigma,
-                                      min_confidence=0.08)
-    masks = _combined_to_masks(combined)
+    # -- gaussian smoothing of label boundaries --
+    vol = merge_masks(masks, shape)
+    vol = smooth_labels(vol, sigma=args.smooth_sigma)
+    masks = split_labels(vol)
 
-    # ── 12. CT-guided refinement (optional) ──
-    if ct_data is not None:
-        print(f"  [{case_id}] CT-guided bone-mask refinement...")
-        masks = ct_guided_refinement(masks, ct_data, shape,
-                                     bone_low=args.bone_low,
-                                     bone_high=args.bone_high)
+    # -- optional: trim to bone HU range using the CT --
+    if ct is not None:
+        masks = refine_with_ct(masks, ct, shape,
+                               hu_lo=args.bone_low, hu_hi=args.bone_high)
 
-    # ── 13. Sanity checks ──
-    print(f"  [{case_id}] Sanity checks...")
-    volume_sanity_check(masks, case_id)
-    adjacency_check(masks, si_axis, case_id)
+    # -- sanity checks (just warnings) --
+    check_volumes(masks, case_id)
+    check_adjacency(masks, si_axis, case_id)
 
-    # ── 14. Save ──
-    print(f"  [{case_id}] Saving...")
-    out_combined = np.zeros(shape, dtype=np.uint8)
-    for label in VERTEBRAE_LABELS:
-        m = masks.get(label)
+    # -- save --
+    out_dir = os.path.join(output_dir, case_id)
+    os.makedirs(out_dir, exist_ok=True)
+
+    out_vol = np.zeros(shape, dtype=np.uint8)
+    for lab in VERT_LABELS:
+        m = masks.get(lab)
         if m is not None:
-            out_combined[m > 0] = label
+            out_vol[m > 0] = lab
+    nib.save(nib.Nifti1Image(out_vol, affine),
+             os.path.join(out_dir, "combined_labels.nii.gz"))
 
-    out_case_dir = os.path.join(output_dir, case_id)
-    os.makedirs(out_case_dir, exist_ok=True)
-    nib.save(
-        nib.Nifti1Image(out_combined, affine),
-        os.path.join(out_case_dir, "combined_labels.nii.gz"),
-    )
-    seg_dir = os.path.join(out_case_dir, "segmentations")
+    seg_dir = os.path.join(out_dir, "segmentations")
     os.makedirs(seg_dir, exist_ok=True)
-    for label in VERTEBRAE_LABELS:
-        name = CLASS_MAP_VERTEBRAE[label]
-        m = masks.get(label)
-        if m is None:
-            m = np.zeros(shape, dtype=np.uint8)
-        nib.save(
-            nib.Nifti1Image(m.astype(np.uint8), affine),
-            os.path.join(seg_dir, f"{name}.nii.gz"),
-        )
-    final_present = _present_labels(masks)
-    print(f"  [{case_id}] Done -> {out_case_dir}  "
-          f"({len(final_present)} labels saved)")
+    for lab in VERT_LABELS:
+        m = masks.get(lab, np.zeros(shape, dtype=np.uint8))
+        nib.save(nib.Nifti1Image(m.astype(np.uint8), affine),
+                 os.path.join(seg_dir, f"{VERT_NAMES[lab]}.nii.gz"))
 
+    n_out = len(nonempty_labels(masks))
+    print(f"  [{case_id}] saved {n_out} labels -> {out_dir}")
+
+
+# ---------------------------------------------------------------------------
 
 def main():
     p = argparse.ArgumentParser(
-        description="Postprocess vertebrae masks from SuPreM inference.",
-    )
-    # I/O
-    p.add_argument("--input_dir", type=str, default="./AbdomenAtlasDemoPredict",
-                    help="Dir with case folders containing combined_labels.nii.gz")
-    p.add_argument("--output_dir", type=str, default="./AbdomenAtlasDemoPredict_refined",
-                    help="Output directory for refined masks")
-    p.add_argument("--ct_root_path", type=str, default=None,
-                    help="Root of original CT data (for CT-guided refinement). "
-                         "Expected structure: <ct_root>/<case_id>/ct.nii.gz")
-    # Cleanup
-    p.add_argument("--min_component_voxels", type=int, default=100,
-                    help="Min voxels to keep a connected component")
+        description="Postprocess vertebrae masks from SuPreM inference.")
+
+    p.add_argument("--input_dir", default="./AbdomenAtlasDemoPredict")
+    p.add_argument("--output_dir", default="./AbdomenAtlasDemoPredict_refined")
+    p.add_argument("--ct_root_path", default=None,
+                   help="path to original CTs (<root>/<case>/ct.nii.gz)")
+
+    p.add_argument("--min_component_voxels", type=int, default=100)
     p.add_argument("--max_outlier_deviation", type=float, default=60,
-                    help="Max lateral deviation from spine centerline (voxels)")
-    # Gap filling
+                   help="max lateral offset from spine centerline (voxels)")
     p.add_argument("--gap_closing_radius", type=int, default=10,
-                    help="SI-axis closing radius for spine envelope (voxels)")
+                   help="SI-axis closing half-width for spine envelope")
     p.add_argument("--no_interpolate", action="store_true",
-                    help="Disable missing-vertebra interpolation")
-    # Morphology
-    p.add_argument("--no_fill_holes", action="store_true",
-                    help="Disable binary hole filling")
+                   help="skip missing-vertebra interpolation")
+    p.add_argument("--no_fill_holes", action="store_true")
     p.add_argument("--closing_size", type=int, default=3,
-                    help="Base binary closing structure size (0 to disable)")
-    # Smoothing
+                   help="base morphological closing kernel size")
     p.add_argument("--smooth_sigma", type=float, default=1.5,
-                    help="Gaussian sigma for label boundary smoothing")
-    # CT-guided
+                   help="gaussian sigma for label smoothing")
     p.add_argument("--bone_low", type=int, default=150,
-                    help="Lower HU threshold for bone mask (CT-guided mode)")
+                   help="lower HU bound for bone mask")
     p.add_argument("--bone_high", type=int, default=3000,
-                    help="Upper HU threshold for bone mask (CT-guided mode)")
+                   help="upper HU bound for bone mask")
+
     args = p.parse_args()
 
     if not os.path.isdir(args.input_dir):
-        print(f"Error: input_dir not found: {args.input_dir}")
+        print(f"error: {args.input_dir} not found")
         sys.exit(1)
     os.makedirs(args.output_dir, exist_ok=True)
 
-    case_dirs = []
-    for name in sorted(os.listdir(args.input_dir)):
-        path = os.path.join(args.input_dir, name)
-        if os.path.isdir(path) and os.path.isfile(
-                os.path.join(path, "combined_labels.nii.gz")):
-            case_dirs.append(path)
-
-    if not case_dirs:
-        print(f"No case directories with combined_labels.nii.gz found in "
-              f"{args.input_dir}")
+    cases = sorted(
+        os.path.join(args.input_dir, d) for d in os.listdir(args.input_dir)
+        if os.path.isdir(os.path.join(args.input_dir, d))
+        and os.path.isfile(os.path.join(args.input_dir, d, "combined_labels.nii.gz"))
+    )
+    if not cases:
+        print(f"no cases found in {args.input_dir}")
         sys.exit(0)
 
-    print(f"Postprocessing {len(case_dirs)} case(s): "
-          f"{args.input_dir} -> {args.output_dir}")
-    for case_dir in case_dirs:
-        process_case(case_dir, args.output_dir, args,
-                     ct_root_path=args.ct_root_path)
-    print("All done.")
+    print(f"processing {len(cases)} case(s): {args.input_dir} -> {args.output_dir}")
+    for case_dir in cases:
+        process_case(case_dir, args.output_dir, args, ct_root=args.ct_root_path)
+    print("done.")
 
 
 if __name__ == "__main__":
