@@ -1,11 +1,12 @@
+import os
 import torch
 import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
-import os
 import argparse
 import shutil
 import nibabel as nib
+from monai.data import MetaTensor
 from monai.inferers import sliding_window_inference
 from model.Universal_model import Universal_model
 from model.SwinUNETR_target import SwinUNETR
@@ -107,14 +108,24 @@ def validation(model, ValLoader, val_transforms, args):
             original_affine = nib.load(image_file_path).affine
             with torch.no_grad():
                 # print("Image: {}, shape: {}".format(name[0], image.shape))
-                val_outputs = sliding_window_inference(image, (args.roi_x, args.roi_y, args.roi_z), 1, model, overlap=args.overlap, mode='gaussian', sw_device="cuda", device="cpu")
+                sw_device = "cpu" if args.device == "cpu" else "cuda"
+                val_outputs = sliding_window_inference(image, (args.roi_x, args.roi_y, args.roi_z), 1, model, overlap=args.overlap, mode='gaussian', sw_device=sw_device, device="cpu")
                 val_outputs = F.softmax(val_outputs, dim=1)
                 # print(val_outputs.shape)
                 hard_val_outputs = torch.argmax(val_outputs, dim=1).unsqueeze(1)
                 # print(hard_val_outputs.shape)
                 # print(np.unique(hard_val_outputs))
  
-            batch["pred"] = hard_val_outputs
+            # MONAI 1.x+ inverse (e.g. CropForegroundd) expects MetaTensor with applied_operations
+            img = batch["image"]
+            if isinstance(img, MetaTensor) and getattr(img, "applied_operations", None):
+                batch["pred"] = MetaTensor(
+                    hard_val_outputs,
+                    applied_operations=img.applied_operations,
+                    meta=getattr(img, "meta", None),
+                )
+            else:
+                batch["pred"] = hard_val_outputs
             batch = invert_transform('pred', batch, val_transforms)
             pred = batch[0]['pred'].cpu().numpy()[0]
             # print(pred.shape)    
@@ -182,7 +193,7 @@ def main():
     parser.add_argument('--cache_dataset', action="store_true", default=False, help='whether use cache dataset')
     parser.add_argument('--store_result', action="store_true", default=False, help='whether save prediction result')
     parser.add_argument('--cache_rate', default=0.6, type=float, help='The percentage of cached data in total')
-    parser.add_argument('--cpu',action="store_true", default=False, help='The entire inference process is performed on the GPU ')
+    parser.add_argument('--cpu', action="store_true", default=False, help='Run inference on CPU only (avoids cuDNN/CUDA issues; slower)')
     parser.add_argument('--threshold_organ', default='Pancreas Tumor')
     parser.add_argument('--backbone', default='unet', help='backbone [swinunetr or unet]')
     parser.add_argument('--create_dataset',action="store_true", default=False)
@@ -190,6 +201,13 @@ def main():
     parser.add_argument('--customize',action="store_true", default=False)
 
     args = parser.parse_args()
+
+    # Device: respect --cpu so sliding_window runs on CPU when CUDA/cuDNN misbehaves
+    args.device = "cpu" if args.cpu else (args.device or "cuda")
+
+    # If CUDNN_STATUS_NOT_INITIALIZED occurs, run with: SUPREM_DISABLE_CUDNN=1 python ... or use --cpu
+    if not args.cpu and torch.cuda.is_available() and os.environ.get("SUPREM_DISABLE_CUDNN", "").lower() in ("1", "true", "yes"):
+        torch.backends.cudnn.enabled = False
 
     # prepare the 3D model
     
@@ -233,8 +251,9 @@ def main():
         
     model.load_state_dict(store_dict)
     print('Use pretrained weights')
-    model.cuda()
-    torch.backends.cudnn.benchmark = True
+    model.to(args.device)
+    if args.device == "cuda":
+        torch.backends.cudnn.benchmark = True
     test_loader, val_transforms = get_loader(args)
     validation(model, test_loader, val_transforms, args)
 

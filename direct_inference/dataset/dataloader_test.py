@@ -1,6 +1,6 @@
 from monai.transforms import (
     AsDiscrete,
-    AddChanneld,
+    EnsureChannelFirstd,
     Compose,
     CropForegroundd,
     LoadImaged,
@@ -353,7 +353,7 @@ def get_loader(args):
     train_transforms = Compose(
         [
             LoadImageh5d(keys=["image", "label"]), #0
-            AddChanneld(keys=["image", "label"]),
+            EnsureChannelFirstd(keys=["image", "label"]),
             Orientationd(keys=["image", "label"], axcodes="RAS"),
             Spacingd(
                 keys=["image", "label"],
@@ -408,7 +408,7 @@ def get_loader(args):
         val_transforms = Compose(
             [
                 LoadImaged(keys=["image", "label"]),
-                AddChanneld(keys=["image", "label"]),
+                EnsureChannelFirstd(keys=["image", "label"]),
                 Orientationd(keys=["image", "label"], axcodes="RAS"),
                 # ToTemplatelabeld(keys=['label']),
                 # RL_Splitd(keys=['label']),
@@ -433,7 +433,7 @@ def get_loader(args):
         val_transforms = Compose(
             [
                 LoadImaged(keys=["image"]),
-                AddChanneld(keys=["image"]),
+                EnsureChannelFirstd(keys=["image"]),
                 Orientationd(keys=["image"], axcodes="RAS"),
                 # ToTemplatelabeld(keys=['label']),
                 # RL_Splitd(keys=['label']),
@@ -451,7 +451,7 @@ def get_loader(args):
                     clip=True,
                 ),
                 CropForegroundd(keys=["image"], source_key="image"),
-                ToTensord(keys=["image"]),
+                # Omit ToTensord so image stays MetaTensor with applied_operations for inverse (MONAI 1.x+)
             ]
     )
     

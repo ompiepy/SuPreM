@@ -12,10 +12,10 @@ ml-collections
 einops
 timm
 elasticdeform
-numpy
+numpy<2
 nibabel
 scipy
 pandas
 glob2
 opencv-python
-pytorch-lightning==1.6.4
+pytorch-lightning>=1.6.4,<1.7

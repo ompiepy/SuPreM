@@ -29,7 +29,7 @@ from monai.utils import (
     optional_import,
 )
 
-from monai.data import decollate_batch
+from monai.data import MetaTensor, decollate_batch
 from monai.transforms import Invertd, SaveImaged
 
 
@@ -724,16 +724,30 @@ def save_organ_label(batch,save_dir,input_transform,organ_index):
     BATCH = [post_transforms(i) for i in decollate_batch(batch)]
 
 def invert_transform(invert_key = str,batch = None, input_transform = None ):
+    orig_keys = "image"
+    decollated = decollate_batch(batch)
+    # MONAI 1.x+ inverse (e.g. CropForegroundd.inverse) requires MetaTensor with applied_operations
+    for i in decollated:
+        img = i.get(orig_keys)
+        val = i.get(invert_key)
+        if isinstance(img, MetaTensor) and getattr(img, "applied_operations", None):
+            if not isinstance(val, MetaTensor):
+                val = torch.as_tensor(np.asarray(val)) if isinstance(val, np.ndarray) else (val.cpu() if val.is_cuda else val)
+                i[invert_key] = MetaTensor(
+                    val,
+                    applied_operations=img.applied_operations,
+                    meta=getattr(img, "meta", None),
+                )
     post_transforms = Compose([
         Invertd(
             keys=invert_key,
             transform=input_transform,
-            orig_keys="image",
+            orig_keys=orig_keys,
             nearest_interp=True,
             to_tensor=True,
         ),
     ])
-    BATCH = [post_transforms(i) for i in decollate_batch(batch)]
+    BATCH = [post_transforms(i) for i in decollated]
     return BATCH
 
 
